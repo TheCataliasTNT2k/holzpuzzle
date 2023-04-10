@@ -1,14 +1,21 @@
-mod rect;
+extern crate core;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::{fs, thread};
-use std::cmp::max;
-use std::time::{Instant};
-use itertools::{Itertools};
-
+use std::cmp::{max, min};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::process::id;
 use std::sync::{Arc, Mutex};
-use crate::rect::{RecDimension, RecId, Rectangle, RectCombinationStorage, combination_storage_to_file, combination_storage_from_file, combination_to_string, Combination, get_unique_combination_key, combination_from_string, PlacedRectangle};
+use std::time::Instant;
 
+use image::{Rgb, RgbImage};
+use imageproc::drawing::{draw_filled_rect_mut, draw_hollow_rect_mut, draw_text_mut};
+use rusttype::{Font, Scale};
+use imageproc::rect::Rect;
+use itertools::Itertools;
+
+use crate::rect::{Combination, combination_from_string, combination_storage_from_file, combination_storage_to_file, combination_to_string, get_unique_combination_key, PlacedRectangle, RecDimension, RecId, Rectangle, RectCombinationStorage, redup_comb_iter};
+
+mod rect;
 
 pub(crate) struct ProgramStorage {
     pub big_rect: Rectangle,
@@ -16,30 +23,32 @@ pub(crate) struct ProgramStorage {
     pub available_block_map: HashMap<RecId, Rectangle>,
     pub rotated_available_block_map: HashMap<RecId, HashSet<Rectangle>>,
     pub gathered_combinations: RectCombinationStorage,
-    pub meaningful_combinations: RectCombinationStorage,
+    pub deduplicated_combinations: RectCombinationStorage,
     pub solutions: RectCombinationStorage,
     pub combined_solutions: HashSet<BTreeSet<Combination>>,
     pub final_combinations: Vec<Combination>,
-    pub settings: Settings
+    pub settings: Settings,
 }
 
 pub struct Settings {
     pub thread_count: u8,
-    pub min_solution_area_multiplier: f32,
+    pub min_solution_area: u32,
     pub min_rectangle_amount: u8,
     pub max_rectangle_amount: u8,
+    pub distance_between_rectangles: u32,
     pub steps: [bool; 4],
     pub candidates_path: &'static str,
     pub fitting_candidates_path: &'static str,
+    pub deduplicated_combinations_path: &'static str,
     pub solutions_filepath: &'static str,
     pub final_combinations_path: &'static str,
 
 }
 
 /// collect all candidates, which may fit inside the big rectangle
-fn generate_candidates(storage: &mut ProgramStorage) {
+fn step1_generate_candiates(storage: &mut ProgramStorage) {
     let mut gathered_combinations = combination_storage_from_file(storage.settings.candidates_path, storage);
-    println!("GATHERING COMBINATIONS....");
+    println!("GATHERING COMBINATIONS...");
     if !storage.settings.steps[0] {
         println!("SKIPPED");
         storage.gathered_combinations = gathered_combinations;
@@ -48,7 +57,8 @@ fn generate_candidates(storage: &mut ProgramStorage) {
     let start = Instant::now();
     let mut counter: u64 = 0;
     // for each number of rectangles, collect all combinations
-    for s in storage.settings.min_rectangle_amount..storage.settings.max_rectangle_amount + 1 {
+    for s in storage.settings.min_rectangle_amount..=storage.settings.max_rectangle_amount {
+        let mut counter2 = 0;
         for comb in storage.available_blocks.iter().combinations(s as usize) {
             counter += 1;
             if counter % 1000000 == 0 {
@@ -56,83 +66,54 @@ fn generate_candidates(storage: &mut ProgramStorage) {
             }
             // if this combination may fit in the big rectangle, keep it
             if comb.iter().map(|r| r.area).sum::<u32>() <= storage.big_rect.area {
+                counter2 += 1;
                 gathered_combinations.insert(comb.iter().map(|r| **r).collect());
             }
         }
-        println!("{s} {counter}");
+        println!("{s} {counter2}");
     }
     // sort, save and all that stuff
     println!("{}", gathered_combinations.len());
     // be careful, this might eliminate possible final solutions!!!!!!
     gathered_combinations.retain(|s|
-        s.iter().map(|r| r.area).sum::<u32>() >=
-        (storage.big_rect.area as f32 * storage.settings.min_solution_area_multiplier) as u32
+        s.iter().map(|r| r.area).sum::<u32>() >= storage.settings.min_solution_area
     );
     println!("{}", gathered_combinations.len());
     storage.gathered_combinations = gathered_combinations;
 
     combination_storage_to_file(storage.settings.candidates_path, &storage.gathered_combinations);
 
-    println!("GATHERING COMBINATIONS.... DONE AFTER {} seconds, found {} combinations", start.elapsed().as_secs(), storage.gathered_combinations.len());
+    println!("GATHERING COMBINATIONS... DONE AFTER {} seconds, found {} combinations", start.elapsed().as_secs(), storage.gathered_combinations.len());
 }
 
-/// not used\
 /// deduplicates all equivalent combinations\
 /// needs changes in filter_fitting_candidates to use this output as next step\
 /// needs "reduplication" before calculate_matches!
-/*fn filter_meaningful_combinations(storage: &mut ProgramStorage) {
-    let candidates = storage.gathered_combinations.iter()
-        .map(|c| (c.iter().map(|r| r.area).sum::<u32>(), c))
-        .sorted_by_key(|(a, _)| -(*a as i32))
-        .map(|(_, s)| s)
-        .collect::<Vec<&BTreeSet<Rectangle>>>();
-    let mut result = HashSet::new();
+fn step2_deduplication(storage: &mut ProgramStorage) {
+    let candidates = storage.gathered_combinations.iter().cloned().collect::<Vec<BTreeSet<Rectangle>>>();
 
-    println!("BLAAAAAAAAAAAAAAA with {} candidates....", candidates.len());
-    for i in 0..candidates.len() {
-        if i % 100 == 0 {
-            println!("{} {}", i, result.len());
-        }
-        if result.len() >= candidates.len() {
-            break;
-        }
-        let is = candidates.get(i).unwrap();
-        for j in i+1..candidates.len() {
-            let js = candidates.get(j).unwrap();
-            let ij = *is | *js;
-            if ij.len() == is.len() + js.len() && (storage.available_blocks.len() as u8) >= ij.len() as u8 + storage.settings.min_rectangle_amount {
-                for k in j+1..candidates.len() {
-                    let ks = candidates.get(k).unwrap();
-                    let amount = (&ij | ks).len();
-                    if amount >= storage.available_blocks.len() {
-                        result.insert(is.to_owned().clone());
-                        result.insert(ks.to_owned().clone());
-                        result.insert(js.to_owned().clone());
-                    }
-                }
-            }
-        }
-    }
-    storage.meaningful_combinations = result.into_iter()
+    println!("DEDUPLICATING {} COMBINATIONS...", candidates.len());
+    storage.deduplicated_combinations = candidates.into_iter()
         .unique_by(get_unique_combination_key)
         .collect();
     fs::write(
-        "./fiiiiiiiiiiiiiiiiiiiiileeeee",
-        storage.meaningful_combinations.iter()
+        storage.settings.deduplicated_combinations_path,
+        storage.deduplicated_combinations.iter()
             .map(combination_to_string)
             .join("\n"),
     ).expect("Unable to write file");
-    println!("We have {} meaningful combinations!", storage.meaningful_combinations.len());
-}*/
+    println!("We have {} deduplicated combinations!", storage.deduplicated_combinations.len());
+}
 
 /// check for each combination, if it can be arranged inside the big rectangle
-fn filter_fitting_candidates(storage: &mut ProgramStorage) {
-    println!("CALCULATING SOLUTIONS (1 layer)....");
+fn step3_filter_fitting_candidates(storage: &mut ProgramStorage) {
+    println!("CALCULATING SOLUTIONS (1 layer)...");
     if !storage.settings.steps[1] {
         storage.solutions = combination_storage_from_file(storage.settings.fitting_candidates_path, storage);
         println!("SKIPPED");
         return;
     }
+
     let start = Instant::now();
     let output = Arc::new(Mutex::new(HashSet::new()));
     // do all the checking threaded
@@ -142,7 +123,7 @@ fn filter_fitting_candidates(storage: &mut ProgramStorage) {
                 (
                     0,
                     // sort by area of combination
-                    storage.gathered_combinations.iter().cloned()
+                    storage.deduplicated_combinations.iter().cloned()
                         .sorted_by_key(|c| -(c.iter().map(|r| r.area).sum::<u32>() as i32))
                         .collect::<Vec<BTreeSet<Rectangle>>>()
                 )
@@ -151,11 +132,11 @@ fn filter_fitting_candidates(storage: &mut ProgramStorage) {
         let mut threads = Vec::new();
 
         // run threads because this will take a while
-        for i in 1..storage.settings.thread_count + 1 {
+        for i in 1..=storage.settings.thread_count {
             let thread_input = input.clone();
             let thread_output = output.clone();
             let thread = s.spawn(move || {
-                do_work(i, thread_input, thread_output);
+                step3_thread_procedure(i, thread_input, thread_output);
             });
             threads.push(thread);
         }
@@ -169,13 +150,13 @@ fn filter_fitting_candidates(storage: &mut ProgramStorage) {
     let fitting_candidates = Arc::try_unwrap(output).unwrap().into_inner().unwrap();
     combination_storage_to_file(storage.settings.fitting_candidates_path, &fitting_candidates);
     storage.solutions = fitting_candidates;
-    println!("CALCULATING SOLUTIONS (1 layer).... DONE AFTER {} seconds, found {} solutions", start.elapsed().as_secs(), storage.solutions.len());
+    println!("CALCULATING SOLUTIONS (1 layer)... DONE AFTER {} seconds, found {} solutions", start.elapsed().as_secs(), storage.solutions.len());
 }
 
 /// this funktion is the main function, which will be run by the threads of filter_fitting_candidates
-fn do_work(number: u8,
-           input: Arc<(&ProgramStorage, Mutex<(i32, Vec<BTreeSet<Rectangle>>)>)>,
-           output: Arc<Mutex<RectCombinationStorage>>,
+fn step3_thread_procedure(number: u8,
+                          input: Arc<(&ProgramStorage, Mutex<(i32, Vec<BTreeSet<Rectangle>>)>)>,
+                          output: Arc<Mutex<RectCombinationStorage>>,
 ) {
     let thread_start = Instant::now();
     let storage = input.0;
@@ -183,20 +164,20 @@ fn do_work(number: u8,
     loop {
         // get combination to check
         let mut lock = mutex.lock().unwrap();
-        lock.0 += 1;
-        let counter = lock.0;
         if lock.1.is_empty() {
             println!("Thread {number} is shutting down! I was alive {} for seconds.", thread_start.elapsed().as_secs());
             drop(lock);
             return;
         }
+        lock.0 += 1;
+        let counter = lock.0;
         let data = lock.1.remove(0);
         drop(lock);
         if counter % 100 == 0 {
             println!("Thread {number} working counter {counter} with data {}.", data.iter().map(|r| r.id).join(","));
         }
         // ic combination can be put somehow in the big rect, store it
-        if check_candidate(number, counter, storage, &data).is_some() {
+        if step3_check_candidate(number, counter, storage, &data).is_some() {
             let mut lock = output.lock().unwrap();
             lock.insert(data);
             println!("Thread {number}: We have {} candidates so far.", lock.len());
@@ -206,20 +187,20 @@ fn do_work(number: u8,
 }
 
 /// for checking if a combination fits inside the big rect
-fn check_candidate(number: u8, counter: i32,
-                   storage: &ProgramStorage,
-                   candidate: &BTreeSet<Rectangle>,
-) -> Option<Vec<Rectangle>> {
+fn step3_check_candidate(number: u8, counter: i32,
+                         storage: &ProgramStorage,
+                         candidate: &BTreeSet<Rectangle>,
+) -> Option<Vec<PlacedRectangle>> {
     let c_start = Instant::now();
     // because the small rectangles can be rotated, we need to check each combination of each rotation for the input
     for product in candidate.iter().map(|r| storage.rotated_available_block_map.get(&r.id).unwrap()).multi_cartesian_product() {
         // because I have no better idea, just check each permutation of each combination individually
         for per in product.iter().cloned().permutations(product.len()) {
-            if check_permutation(storage, per.clone()) {
+            if let Some(sol) = step3_check_permutation(storage, per.clone()) {
                 if counter % 100 == 0 && number > 0 {
                     println!("Thread {number} worked {counter} in {} seconds (success)", c_start.elapsed().as_secs());
                 }
-                return Some(per.into_iter().copied().collect());
+                return Some(sol);
             }
         }
     }
@@ -230,11 +211,11 @@ fn check_candidate(number: u8, counter: i32,
 }
 
 /// if a specific set of rectangles fits inside the big rect, without rotating or rearranging them
-fn check_permutation(storage: &ProgramStorage, candidate: Vec<&Rectangle>) -> bool {
+fn step3_check_permutation(storage: &ProgramStorage, candidate: Vec<&Rectangle>) -> Option<Vec<PlacedRectangle>> {
     /*
     idea:
     put all rectangles inside the big rectangle in order
-    if rect has e.g. width 23 and x is 0 at the moment, it will occupy 0, 1, 2.... 22, not 23!
+    if rect has e.g. width 23 and x is 0 at the moment, it will occupy 0, 1, 2... 22, not 23!
     leave space horizontally and vertically to accommodate for slightly smaller or bigger ones
     if width is filled, go to "higher" row
     move rectangles closer together without collisions (touching is also not allowed)
@@ -244,50 +225,51 @@ fn check_permutation(storage: &ProgramStorage, candidate: Vec<&Rectangle>) -> bo
     // x without spaces to check for "full row"
     let mut x_normal: RecDimension = 0;
     // how big the "spaces" should be
-    let distance = 10;
+    let distance = storage.settings.distance_between_rectangles;
     // store placed rects
     let mut placed_rects: Vec<PlacedRectangle> = vec![];
     // store the height of each column
     let x_size = storage.big_rect.width + (storage.big_rect.width / storage.settings.max_rectangle_amount as RecDimension) as RecDimension * distance;
+    let mut taken_with_spaces = vec![0 as RecDimension; x_size as usize];
     let mut taken = vec![0 as RecDimension; x_size as usize];
-    // make everything more cache effizient (width and height with spaces put in)
+    // make everything more cache efficient (width and height with spaces put in)
     let big_width = storage.big_rect.width;
-    let mut row_height: RecDimension = 0;
-    let mut total_height: RecDimension = 0;
     for rect in candidate {
         // if the new rect will collide with the border of the big rect
         if x_normal + rect.width >= big_width {
             // go back to x 0 for next row
             x_normal = 0;
             x_with_spaces = 0;
-            // store height of last column
-            total_height += row_height;
-            row_height = 0;
-            // if the total height of all rects in one row, without spacings, is higher than the rect height, break
-            if total_height > storage.big_rect.height {
-                return false;
+            if taken.iter().max().unwrap() > &storage.big_rect.height {
+                return None;
             }
         }
         // the new rect can not be lower than the highest point within its "area"
+        let mut ymax_with_spaces: RecDimension = 0;
+        for i in x_with_spaces..x_with_spaces + rect.width {
+            ymax_with_spaces = max(ymax_with_spaces, taken_with_spaces[i as usize]);
+        }
         let mut ymax: RecDimension = 0;
         for i in x_with_spaces..x_with_spaces + rect.width {
             ymax = max(ymax, taken[i as usize]);
         }
-        // if this is not the first row, add space to last row
-        if ymax > 0 {
-            ymax += distance;
+        // if this is not the first row, add space to height
+        if ymax_with_spaces > 0 {
+            ymax_with_spaces += distance;
         }
         // add new rect to placed rects, at this position
         placed_rects.push(PlacedRectangle {
             rect: *rect,
             x: x_with_spaces,
-            y: ymax,
+            y: ymax_with_spaces,
         });
-        // calculate new height to avoid this rectangle when setting the next row
+        // calculate new height to avoid colliding with this rectangle when setting the next row
+        ymax_with_spaces += rect.height;
         ymax += rect.height;
-        // calculate new height of this row
-        row_height = max(row_height, rect.height);
         // store ymax for all "columns" the new rect occupies
+        for i in x_with_spaces..x_with_spaces + rect.width {
+            taken_with_spaces[i as usize] = ymax_with_spaces;
+        }
         for i in x_with_spaces..x_with_spaces + rect.width {
             taken[i as usize] = ymax;
         }
@@ -295,9 +277,8 @@ fn check_permutation(storage: &ProgramStorage, candidate: Vec<&Rectangle>) -> bo
         x_with_spaces += rect.width + distance;
         x_normal += rect.width;
     }
-    // if the total height of all rects in one row, without spacings, is higher than the rect height, break
-    if total_height > storage.big_rect.height {
-        return false;
+    if taken.iter().max().unwrap() > &storage.big_rect.height {
+        return None;
     }
     let mut compacted = true;
     let mut p;
@@ -314,43 +295,45 @@ fn check_permutation(storage: &ProgramStorage, candidate: Vec<&Rectangle>) -> bo
         }
     }
     // check if all rects are inside the big rect now
-    placed_rects.iter().all(|p| p.check_bounds(storage))
+    if placed_rects.iter().all(|p| p.check_bounds(storage)) {
+        Some(placed_rects)
+    } else {
+        None
+    }
 }
 
 /// take three disjunctive combinations of the combinations, which fit inside the big rect\
 /// these three combinations represent the three layers inside the big rect
-fn calculate_matches(storage: &mut ProgramStorage) {
+fn step4_calculate_matches(storage: &mut ProgramStorage) {
     if !storage.settings.steps[2] {
         storage.combined_solutions = fs::read_to_string(storage.settings.solutions_filepath).unwrap_or_else(|_| "".to_owned())
             .split('\n')
             .filter(|line| !line.is_empty())
             .map(|line|
                 line.split(' ')
-                .map(|c| combination_from_string(storage, c)).collect()
+                    .map(|c| combination_from_string(storage, c)).collect()
             ).collect::<HashSet<BTreeSet<Combination>>>();
-        println!("CALCULATING COMBINED SOLUTIONS (3 layers)....\nSKIPPED");
+        println!("CALCULATING COMBINED SOLUTIONS (3 layers)...\nSKIPPED");
         return;
     }
     // sort the candidates by area
-    let candidates = storage.solutions.iter()
-        .map(|c| (c.iter().map(|r| r.area).sum::<u32>(), c))
-        .sorted_by_key(|(a, _)| -(*a as i32))
-        .map(|(_, s)| s)
-        .collect::<Vec<&BTreeSet<Rectangle>>>();
+    let candidates = redup_comb_iter(storage.solutions.iter(), storage)
+        .sorted_by_key(|c| -(c.iter().map(|r| r.area).sum::<u32>() as i32))
+        .collect::<Vec<BTreeSet<Rectangle>>>();
     let start = Instant::now();
 
-    println!("CALCULATING COMBINED SOLUTIONS (3 layers) with {} candidates....", candidates.len());
+    println!("CALCULATING COMBINED SOLUTIONS (3 layers) with {} candidates...", candidates.len());
     for i in 0..candidates.len() {
         if i % 100 == 0 {
             println!("{} {}", i, storage.combined_solutions.len());
         }
         let is = candidates.get(i).unwrap();
-        for j in i+1..candidates.len() {
+        for j in i + 1..candidates.len() {
             let js = candidates.get(j).unwrap();
-            let ij = *is | *js;
+            let ij = is | js;
             // two candidates need to be disjunctive, otherwise they can not be a solution
             if ij.len() == is.len() + js.len() {
-                for k in j+1..candidates.len() {
+                for k in j + 1..candidates.len() {
                     let ks = candidates.get(k).unwrap();
                     // three candidates need to be disjunctive, otherwise they can not be a solution
                     let amount = (&ij | ks).len();
@@ -372,21 +355,21 @@ fn calculate_matches(storage: &mut ProgramStorage) {
             .map(|l| l.iter().map(combination_to_string).join(" "))
             .join("\n"),
     ).expect("Unable to write file");
-    println!("CALCULATING COMBINED SOLUTIONS (3 layers).... DONE AFTER {} seconds, found {} combined solutions", start.elapsed().as_secs(), storage.combined_solutions.len());
+    println!("CALCULATING COMBINED SOLUTIONS (3 layers)... DONE AFTER {} seconds, found {} combined solutions", start.elapsed().as_secs(), storage.combined_solutions.len());
 }
 
 /// take the possible solutions for three layers and split them in single layer combinations\
 /// sort by how often each combination appears within the possible solutions
-fn sort_final_combinations(storage: &mut ProgramStorage) {
+fn step5_sort_final_combinations(storage: &mut ProgramStorage) {
     if !storage.settings.steps[3] {
-        println!("SORTING FINAL COMBINATIONS....\nSKIPPED");
+        println!("SORTING FINAL COMBINATIONS...\nSKIPPED");
         return;
     }
     let mut combination_counter_map = HashMap::new();
     let mut dedup_string_combination_map = HashMap::new();
     let start = Instant::now();
 
-    println!("SORTING FINAL COMBINATIONS with {} solutions....", storage.combined_solutions.len());
+    println!("SORTING FINAL COMBINATIONS with {} solutions...", storage.combined_solutions.len());
 
     storage.combined_solutions.iter().for_each(|solution| solution.iter().for_each(|c| {
         let dedup = get_unique_combination_key(c);
@@ -399,10 +382,54 @@ fn sort_final_combinations(storage: &mut ProgramStorage) {
         .collect();
 
     fs::write(storage.settings.final_combinations_path,
-              final_combinations.iter().map(|c| c.iter().map(|r| r.id).join(" ")).join("\n")
+              final_combinations.iter().map(|c| c.iter().map(|r| r.id).join(" ")).join("\n"),
     ).expect("Unable to write file");
     storage.final_combinations = final_combinations;
-    println!("CALCULATING FINAL COMBINATIONS.... DONE AFTER {} seconds, found {} final combinations", start.elapsed().as_secs(), storage.final_combinations.len());
+    println!("CALCULATING FINAL COMBINATIONS... DONE AFTER {} seconds, found {} final combinations", start.elapsed().as_secs(), storage.final_combinations.len());
+}
+
+fn get_color(id: RecId, len: usize) -> Rgb<u8> {
+    // let multiplier = (255 / len) as RecId;
+    Rgb([
+        255,
+        255,
+        255
+    ])
+}
+
+fn draw_image(path: &str, storage: &ProgramStorage, data: &Vec<PlacedRectangle>) {
+    let mut image = RgbImage::new(storage.big_rect.width + 20, storage.big_rect.height + 60);
+    draw_filled_rect_mut(&mut image, Rect::at(9, 9).of_size(storage.big_rect.width + 2, storage.big_rect.height + 2), Rgb([0u8, 0u8, 255u8]));
+    draw_hollow_rect_mut(&mut image, Rect::at(9, 9).of_size(storage.big_rect.width + 2, storage.big_rect.height + 2), Rgb([0u8, 255u8, 0u8]));
+
+    let font = Font::try_from_vec(Vec::from(include_bytes!("../DejaVuSans.ttf") as &[u8])).unwrap();
+
+    data.iter().for_each(|r| {
+        let col = get_color(r.rect.id, storage.available_blocks.len());
+        draw_filled_rect_mut(&mut image, Rect::at(r.x as i32 + 10, r.y as i32 + 10).of_size(r.rect.width, r.rect.height), col);
+        let col = Rgb([255 - col[0], 255 - col[1], 255 - col[2]]);
+        draw_hollow_rect_mut(&mut image, Rect::at(r.x as i32 + 10, r.y as i32 + 10).of_size(r.rect.width, r.rect.height), col);
+        draw_text_mut(
+            &mut image,
+            col,
+            (r.x + r.rect.width / 2) as i32,
+            (r.y + r.rect.height / 2) as i32,
+            Scale { x: 50_f32, y: 50_f32 },
+            &font,
+            &format!("{}", r.rect.id)
+        );
+    });
+
+    draw_text_mut(
+        &mut image,
+        Rgb([255u8, 255u8, 255u8]),
+        70,
+        (storage.big_rect.height + 10) as i32,
+        Scale { x: 50 as f32, y: 50 as f32 },
+        &font,
+        &data.iter().map(|r| r.rect.id).sorted().join(", ")
+    );
+    image.save(path).expect("no panic!");
 }
 
 // 5, 6, 11, 13, 16
@@ -415,7 +442,7 @@ fn sort_final_combinations(storage: &mut ProgramStorage) {
 
 fn main() {
     let start = Instant::now();
-    let rect = Rectangle::new(-1, 47, 71);
+    /*let rect = Rectangle::new(-1, 47, 71);
     let blocks = vec![
         Rectangle::new(1, 45, 19),
         Rectangle::new(2, 27, 22),
@@ -435,8 +462,8 @@ fn main() {
         Rectangle::new(16, 52, 12),
         Rectangle::new(17, 45, 12),
         Rectangle::new(18, 22, 10),
-    ];
-    /*let rect = Rectangle::new(-1, 464, 704);
+    ];*/
+    let rect = Rectangle::new(-1, 464, 704);
     let blocks = vec![
         Rectangle::new(1, 450, 198),
         Rectangle::new(2, 274, 223),
@@ -456,7 +483,7 @@ fn main() {
         Rectangle::new(16, 524, 123),
         Rectangle::new(17, 455, 123),
         Rectangle::new(18, 224, 99),
-    ];*/
+    ];
     /*let rect = Rectangle::new(-1, 4635, 7040);
     let blocks = vec![
         Rectangle::new(1, 4500, 1980),
@@ -483,14 +510,16 @@ fn main() {
 
     let settings = Settings {
         thread_count: 16,
-        min_solution_area_multiplier: 0.9,
+        min_solution_area: blocks.iter().map(|b| b.area).sum::<u32>() - 2 * rect.area,
         min_rectangle_amount: 3,
         max_rectangle_amount: 9,
+        distance_between_rectangles: 100,
         candidates_path: "./candidates.txt",
+        deduplicated_combinations_path: "./deduplicated_candidates.txt",
         fitting_candidates_path: "./fitting_candidates.txt",
         solutions_filepath: "./solutions.txt",
         final_combinations_path: "./final_candidates.txt",
-        steps: [false, false, true, true],
+        steps: [false, false, false, false],
     };
     let mut storage = ProgramStorage {
         big_rect: rect,
@@ -498,65 +527,76 @@ fn main() {
         available_block_map: block_map,
         rotated_available_block_map: rotated_available_blocks,
         gathered_combinations: Default::default(),
-        meaningful_combinations: Default::default(),
+        deduplicated_combinations: Default::default(),
         solutions: Default::default(),
         combined_solutions: Default::default(),
         final_combinations: Default::default(),
-        settings
+        settings,
     };
     println!("Using blocks:\n{}\n", storage.available_blocks.iter().map(|b| format!("ID: {}, area: {}", b.id, b.area)).join("\n"));
+    println!("Big rect area = {}\nSmall react area sum = {}\n", 3 * rect.area, storage.available_blocks.iter().map(|b| b.area).sum::<u32>());
 
-    generate_candidates(&mut storage);
-    //filter_meaningful_combinations(&mut storage);
-    filter_fitting_candidates(&mut storage);
-    calculate_matches(&mut storage);
-    sort_final_combinations(&mut storage);
+    step1_generate_candiates(&mut storage);
+    step2_deduplication(&mut storage);
+    step3_filter_fitting_candidates(&mut storage);
+    step4_calculate_matches(&mut storage);
+    step5_sort_final_combinations(&mut storage);
 
     println!("The whole run took us {} seconds!", start.elapsed().as_secs());
+    println!("{}", storage.solutions.len());
 
-    // check specific permutation with specific sizes (debug code)
-    /*let x: Vec<Rectangle> = "7 173 200  12 173 323  8 124 224  11 148 249  16 123 524  13 448 174"
-         .split("  ")
-         .map(|s| {
-             let split = s.split(" ").collect::<Vec<&str>>();
-                 Rectangle::new(
-                     split[0].parse::<RecId>().unwrap(), split[1].parse::<RecDimension>().unwrap(), split[2].parse::<RecDimension>().unwrap()
-                 )
-         }
-         ).collect();
-     println!("{}", check_permutation(&storage, x.iter().collect()));*/
 
-    // check collision between two placed rectangles (debug)
-    /*let r1 = PlacedRectangle {
-        rect: *storage.available_block_map.get(&8).unwrap(),
-        x: 0,
-        y: 0,
-    };
-    let r2 = PlacedRectangle {
-        rect: *storage.available_block_map.get(&11).unwrap(),
-        x: 100,
-        y: 0,
-    };
-    let x = vec![r1, r2];
-    println!("{}", r2.check_collision(&r1));*/
 
 
     // check all permutations for solution
-    /*let s = "5 7 8 10 12 14 15 18".split('\n');
+    let s = "5,12,13,14,16".split('\n');
 
     for s1 in s {
         let mut c = BTreeSet::new();
-        for id in s1.trim().split(' ') {
-            c.insert(*storage.available_block_map.get(&id.parse::<RecId>().unwrap()).unwrap());
+        for id in s1.trim().split(',') {
+            c.insert(*storage.available_block_map.get(&id.trim().parse::<RecId>().unwrap()).unwrap());
         }
         println!("Testing possible solution: {}", s1.split(',').join(" "));
-        if let Some(data) = check_candidate(100, 0, &storage, &c) {
-            println!("Solution is: {}", data.iter().map(|r| format!("{} {} {}", r.id, r.height, r.width)).join("  "));
-            println!("Area is: {}", data.iter().map(|r| r.area).sum::<u32>());
+        if let Some(data) = step3_check_candidate(100, 0, &storage, &c) {
+            println!("Solution is: {}", data.iter().map(|r| format!("{} {} {}", r.rect.id, r.rect.height, r.rect.width)).join("  "));
+            println!("Area is: {}", data.iter().map(|r| r.rect.area).sum::<u32>());
+            draw_image("./out.png", &storage, &data);
         } else {
             println!("Not a solution!");
         }
-    }*/
+    }
+
+    let mut x: Vec<Combination> = redup_comb_iter(storage.solutions.iter().filter(
+        |c| c.iter().map(|r| r.area).sum::<u32>() >= 300000
+    )
+        .clone(), &storage).collect();
+    for i in 0..x.len() {
+        let is = x.get(i).unwrap();
+        println!("{}", is.iter().map(|r| r.id).join(","));
+        for j in i+1..x.len() {
+            let js = x.get(j).unwrap();
+            let union: HashSet<RecId> = (is | js).iter().map(|r| r.id).collect();
+            if is.len() + js.len() == union.len() && storage.available_blocks.len() - union.len() <= storage.settings.max_rectangle_amount as usize {
+                println!("{}    {}", is.iter().map(|r| r.id).join(", "), js.iter().map(|r| r.id).join(", "));
+                let c: BTreeSet<Rectangle> = storage.available_block_map.iter()
+                    .filter(|(id, _)| !union.contains(id))
+                    .map(|(_, r)| r)
+                    .copied()
+                    .collect();
+                println!("Testing: {}", c.iter().map(|r| r.id).join(", "));
+                if let Some(data) = step3_check_candidate(0, 0, &storage, &c) {
+                    println!("Solution is: {}", data.iter().map(|r| format!("{} {} {}", r.rect.id, r.rect.height, r.rect.width)).join("  "));
+                    println!("Area is: {}", data.iter().map(|r| r.rect.area).sum::<u32>());
+                    draw_image("./out.png", &storage, &data);
+                } else {
+                    println!("Not a solution!");
+                }
+            }
+        }
+    }
+
+    /*x.clear();
+    x.push();*/
 }
 
 
@@ -583,4 +623,92 @@ fn main() {
 2 3 6 9 12 15
 2 3 6 8 9 12
 310616
+*/
+
+/*
+
+1,2,3,4,5,6
+7,8,9,10,11,12
+13,14,15,16,17,18
+7,8,9,10,11,5
+ */
+
+
+/*
+3,4,5,7,13  2,6,10,11,15,17,18
+
+3,4,5,10,13  2,6,7,11,15,17,18
+3,4,5,10,13  1,6,7,8,11,15,18
+
+
+
+ */
+
+
+
+/*
+// filter combinations by area
+let s: RectCombinationStorage = storage.solutions.iter().filter(
+    |c| c.iter().map(|r| r.area).sum::<u32>() >= 310000
+)
+    .cloned()
+    .unique_by(get_unique_combination_key)
+    .sorted_by_key(|c| -(c.iter().map(|r| r.area).sum::<u32>() as i32))
+    .collect();
+println!("{}", s.len());
+combination_storage_to_file("./sorted.txt", &s);
+
+
+// filter for combinations with specific rect
+let x = storage.solutions.iter().filter(
+    |c| c.iter().any(|r| r.id == 16)
+)
+    .cloned()
+    .sorted_by_key(|c| -(c.iter().map(|r| r.area).sum::<u32>() as i32))
+    .collect::<Vec<Combination>>()
+    .first().unwrap();
+
+println!("{}, {}", x.iter().map(|r| r.id).join(", "), 2+2);*/
+//
+// x.iter().map(|r| r.area).sum::<u32>()
+
+/*// check specific permutation with specific sizes (debug code)
+let mut rect2 = Rectangle::new(-1, 9, 25);
+mem::swap(&mut storage.big_rect, &mut rect2);
+let x: Vec<Rectangle> = "1 4 17  2 7 7  4 3 8  3 2 22"
+     .split("  ")
+     .map(|s| {
+         let split = s.split(" ").collect::<Vec<&str>>();
+             Rectangle::new(
+                 split[0].parse::<RecId>().unwrap(), split[1].parse::<RecDimension>().unwrap(), split[2].parse::<RecDimension>().unwrap()
+             )
+     }
+     ).collect();
+ println!("{}", check_permutation(&storage, x.iter().collect()));*/
+
+// check collision between two placed rectangles (debug)
+/*let r1 = PlacedRectangle {
+    rect: *storage.available_block_map.get(&8).unwrap(),
+    x: 0,
+    y: 0,
+};
+let r2 = PlacedRectangle {
+    rect: *storage.available_block_map.get(&11).unwrap(),
+    x: 100,
+    y: 0,
+};
+let x = vec![r1, r2];
+println!("{}", r2.check_collision(&r1));*/
+
+
+// redup combination
+/*
+let mut c = BTreeSet::new();
+for id in "1,2,3,4,5,6".split(',') {
+    c.insert(*storage.available_block_map.get(&id.trim().parse::<RecId>().unwrap()).unwrap());
+}
+let mut stuff: RectCombinationStorage = HashSet::new();
+stuff.insert(c.clone());
+let stuff2: Vec<Combination> = redup_comb_iter(stuff.iter(), &storage).collect();
+println!("{}", stuff2.iter().map(|c| c.iter().map(|r| r.id).join(", ")).join("\n"));
 */

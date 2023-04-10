@@ -4,11 +4,14 @@ Bisher habe ich das leider noch nicht geschafft.
 
 ## Was tun die Funktionen im Programm?
 
-### `generate_candidates`:
+### `step1_generate_candiates`:
 Sammelt alle (sinnvollen) Kombinationen.  
 Kombinationen mit weniger als 4 oder mehr als 8 Rechtecken passen nicht in das große Rechteck.
 
-### `filter_fitting_candidates`:
+### `step2_deduplication`:
+Schmeißt alle Kombinationen, die ähnlich sind (also Rechtecke mit den gleichen Seitenlängen haben) raus
+
+### `step3_filter_fitting_candidates`:
 Entfernt alle Kombinationen die unmöglich in das große Rechteck passen.  
 Idee: 
 - Einige Rechtecke einer Kombination sind drehbar, das muss berücksichtigt werden (nachfolgend Variable `prod`; wird mittels kartesischem Produkt realisiert)
@@ -21,10 +24,10 @@ Idee:
     Wiederhole diesen Schritt, bis sich keiner des Rechtecke mehr bewegen lässt.
   - Test, ob nun alle Rechtecke innerhalb des großen Rechtecks liegen.
 
-### `calculate_matches`:
+### `step4_calculate_matches`:
 Um eine vollständige Lösung zu erhalten, müssen wir drei Kombinationen finden, die kein kleineres Rechteck gemeinsam haben.
 
-### `sort_final_combinations`:
+### `step5_sort_final_combinations`:
 Sortiert die gefundenen Kombinationen (nicht Lösungen) nach ihrer Relevanz.  
 Je öfter eie Kombination in den Lösungen vorkommt, desto höher ist ihre Relevanz.  
 Dies kann genutzt werden, um die "relevanteren" Lösungen manuell zu testen, wenn man will.

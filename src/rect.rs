@@ -1,8 +1,9 @@
 use std::cmp::{Ordering};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::vec::IntoIter;
 use itertools::Itertools;
 use crate::ProgramStorage;
 
@@ -47,6 +48,57 @@ pub(crate) fn get_unique_combination_key(combination: &Combination) -> String {
         .sorted()
         .map(|s| format!("{},{}", s.0, s.1))
         .join(" ")
+}
+
+pub (crate) fn dedup_comb_iter<I: Iterator>(iter: I) -> impl Iterator + Iterator<Item=Combination>
+    where
+        I: Iterator<Item = Combination>
+{
+    iter.unique_by(get_unique_combination_key)
+}
+
+pub (crate) fn redup_comb_iter<'a, I: Iterator + 'a>(iter: I, storage: &ProgramStorage) -> impl Iterator + Iterator<Item=Combination> + 'a
+    where
+        I: Iterator<Item = &'a Combination>
+{
+    let duplicated: HashMap<RecId, Vec<Rectangle>> = storage.available_blocks.iter()
+        .map(
+            |r| (
+                r.id,
+                storage.available_blocks.iter()
+                    .filter(|r1| r.dedup() == r1.dedup())
+                    .copied()
+                    .collect()
+            )
+        ).collect();
+    iter.flat_map(move |c| duplicate_combination(&mut c.clone(), &duplicated)).unique()
+}
+
+fn duplicate_combination(combination: &mut Combination, duplicated: &HashMap<RecId, Vec<Rectangle>>) -> Vec<Combination> {
+    if combination.is_empty() {
+        return vec![];
+    }
+    let mut out = vec![];
+    // nimm erstes element
+    let element = combination.pop_first().unwrap();
+    // berechne alle duplikate
+    let elements = duplicated.get(&element.id).unwrap();
+    // recurse -> out2
+    let out2 = duplicate_combination(combination, duplicated);
+    if out2.is_empty() {
+        out = elements.iter().map(|r| BTreeSet::from([*r])).collect();
+        out.push(BTreeSet::from([element]));
+        return out;
+    }
+    // hänge an jedes duplikat out2 dran
+    out2.iter().for_each(|c| {
+        elements.iter().for_each(|e| {
+            let mut c2 = c.clone();
+            c2.insert(*e);
+            out.push(c2);
+        })
+    });
+    out
 }
 
 /// a normal rectangle

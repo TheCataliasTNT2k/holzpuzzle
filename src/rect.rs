@@ -1,9 +1,8 @@
-use std::cmp::{Ordering};
+use std::cmp::{min, Ordering};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::vec::IntoIter;
 use itertools::Itertools;
 use crate::ProgramStorage;
 
@@ -14,7 +13,7 @@ pub(crate) type RectCombinationStorage = HashSet<Combination>;
 
 /// load a combination from a string
 pub(crate) fn combination_from_string(storage: &ProgramStorage, line: &str) -> Combination {
-    line.split(',').map(|x| *storage.available_block_map.get(&x.parse::<RecId>().unwrap()).unwrap()).collect()
+    line.split(',').map(|x| *storage.rect_configuration.available_block_map.get(&x.parse::<RecId>().unwrap()).unwrap()).collect()
 }
 
 /// convert combination to string
@@ -50,6 +49,7 @@ pub(crate) fn get_unique_combination_key(combination: &Combination) -> String {
         .join(" ")
 }
 
+#[allow(dead_code)]
 pub (crate) fn dedup_comb_iter<I: Iterator>(iter: I) -> impl Iterator + Iterator<Item=Combination>
     where
         I: Iterator<Item = Combination>
@@ -61,11 +61,11 @@ pub (crate) fn redup_comb_iter<'a, I: Iterator + 'a>(iter: I, storage: &ProgramS
     where
         I: Iterator<Item = &'a Combination>
 {
-    let duplicated: HashMap<RecId, Vec<Rectangle>> = storage.available_blocks.iter()
+    let duplicated: HashMap<RecId, Vec<Rectangle>> = storage.rect_configuration.available_blocks.iter()
         .map(
             |r| (
                 r.id,
-                storage.available_blocks.iter()
+                storage.rect_configuration.available_blocks.iter()
                     .filter(|r1| r.dedup() == r1.dedup())
                     .copied()
                     .collect()
@@ -99,6 +99,10 @@ fn duplicate_combination(combination: &mut Combination, duplicated: &HashMap<Rec
         })
     });
     out
+}
+
+pub(crate) fn get_smallest_side(rects: &Vec<PlacedRectangle>) -> RecDimension {
+    rects.iter().map(|r| min(r.rect.width, r.rect.height)).min().unwrap_or(0)
 }
 
 /// a normal rectangle
@@ -227,6 +231,9 @@ impl PlacedRectangle {
             moved_during_iteration = false;
             // try moving -x and -y at the same time
             loop {
+                if self.x == 0 || self.y == 0 {
+                    break;
+                }
                 old_x_val = self.x;
                 old_y_val = self.y;
                 // do not overshoot
@@ -235,9 +242,6 @@ impl PlacedRectangle {
                 }
                 if self.y > 0 {
                     self.y -= 1;
-                }
-                if self.x == 0 && self.y == 0 {
-                    break;
                 }
                 // if collision with any other rectangle
                 // revert last change and break loop
@@ -249,7 +253,7 @@ impl PlacedRectangle {
                     moved_during_iteration = true;
                 }
             }
-            // ame thing but for x only
+            // same thing but for x only
             loop {
                 if self.x == 0 {
                     break;
@@ -263,7 +267,7 @@ impl PlacedRectangle {
                     moved_during_iteration = true;
                 }
             }
-            // ame thing but for y only
+            // same thing but for y only
             loop {
                 if self.y == 0 {
                     break;
@@ -303,7 +307,44 @@ impl PlacedRectangle {
 
     /// check if this rectangle is completely inside of the bound of the big rectangle
     pub(crate) fn check_bounds(&self, storage: &ProgramStorage) -> bool {
-        self.x + self.rect.width <= storage.big_rect.width &&
-            self.y + self.rect.height <= storage.big_rect.height
+        self.x + self.rect.width <= storage.rect_configuration.big_rect.width &&
+            self.y + self.rect.height <= storage.rect_configuration.big_rect.height
     }
+}
+
+#[test]
+fn test_collision() {
+    let rect1 = PlacedRectangle {
+        rect: Rectangle {
+            id: 2,
+            width: 2,
+            height: 1,
+            area: 2,
+        },
+        x: 0,
+        y: 0,
+    };
+    let rect2 = PlacedRectangle {
+        rect: Rectangle {
+            id: 6,
+            width: 2,
+            height: 2,
+            area: 4,
+        },
+        x: 0,
+        y: 0,
+    };
+    let rect3 = PlacedRectangle {
+        rect: Rectangle {
+            id: 9,
+            width: 1,
+            height: 2,
+            area: 2,
+        },
+        x: 0,
+        y: 0,
+    };
+    assert!(rect1.check_collision(&rect2));
+    assert!(rect2.check_collision(&rect3));
+    assert!(rect3.check_collision(&rect1));
 }

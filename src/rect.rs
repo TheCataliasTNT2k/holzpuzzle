@@ -1,9 +1,12 @@
+use std::borrow::Borrow;
 use std::cmp::{min, Ordering};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
+
 use itertools::Itertools;
+
 use crate::ProgramStorage;
 
 pub type RecId = i8;
@@ -49,32 +52,44 @@ pub(crate) fn get_unique_combination_key(combination: &Combination) -> String {
         .join(" ")
 }
 
-#[allow(dead_code)]
-pub (crate) fn dedup_comb_iter<I: Iterator>(iter: I) -> impl Iterator + Iterator<Item=Combination>
+/// get deduplication key for permutation, useful for `unique_by_key`
+pub(crate) fn get_unique_permutation_key(combination: &Vec<&Rectangle>) -> String {
+    combination.iter()
+        .map(|r| r.dedup_permutation())
+        .map(|s| format!("{},{}", s.0, s.1))
+        .join(" ")
+}
+/*
+/// get deduplication key for combination, useful for `unique_by_key`
+pub(crate) fn get_unique_combination_key<T, Q>(combination: &T) -> String
     where
-        I: Iterator<Item = Combination>
+            Q: Borrow<Rectangle>,
+            T: IntoIterator<Item = Q>
+{
+    combination.into_iter()
+        .map(|r| r.borrow().dedup())
+        .sorted()
+        .map(|s| format!("{},{}", s.0, s.1))
+        .join(" ")
+}*/
+
+#[allow(dead_code)]
+pub(crate) fn dedup_comb_iter<I: Iterator>(iter: I) -> impl Iterator + Iterator<Item=Combination>
+    where
+        I: Iterator<Item=Combination>
 {
     iter.unique_by(get_unique_combination_key)
 }
 
-pub (crate) fn redup_comb_iter<'a, I: Iterator + 'a>(iter: I, storage: &ProgramStorage) -> impl Iterator + Iterator<Item=Combination> + 'a
+#[allow(dead_code)]
+pub(crate) fn redup_comb_iter<'a, I: Iterator + 'a>(iter: I, storage: &'a ProgramStorage<'_>) -> impl Iterator + Iterator<Item=Combination> + 'a
     where
-        I: Iterator<Item = &'a Combination>
+        I: Iterator<Item=&'a Combination>
 {
-    let duplicated: HashMap<RecId, Vec<Rectangle>> = storage.rect_configuration.available_blocks.iter()
-        .map(
-            |r| (
-                r.id,
-                storage.rect_configuration.available_blocks.iter()
-                    .filter(|r1| r.dedup() == r1.dedup())
-                    .copied()
-                    .collect()
-            )
-        ).collect();
-    iter.flat_map(move |c| duplicate_combination(&mut c.clone(), &duplicated)).unique()
+    iter.flat_map(move |c| duplicate_combination(&mut c.clone(), &storage.rect_configuration.duplication_map, &BTreeSet::new())).unique()
 }
 
-fn duplicate_combination(combination: &mut Combination, duplicated: &HashMap<RecId, Vec<Rectangle>>) -> Vec<Combination> {
+pub(crate) fn duplicate_combination(combination: &mut Combination, duplicated: &HashMap<RecId, Vec<Rectangle>>, used_rects: &Combination) -> Vec<Combination> {
     if combination.is_empty() {
         return vec![];
     }
@@ -82,9 +97,9 @@ fn duplicate_combination(combination: &mut Combination, duplicated: &HashMap<Rec
     // nimm erstes element
     let element = combination.pop_first().unwrap();
     // berechne alle duplikate
-    let elements = duplicated.get(&element.id).unwrap();
+    let elements: Vec<Rectangle> = duplicated.get(&element.id).unwrap().iter().filter(|r| !used_rects.contains(r)).copied().collect();
     // recurse -> out2
-    let out2 = duplicate_combination(combination, duplicated);
+    let out2 = duplicate_combination(combination, duplicated, used_rects);
     if out2.is_empty() {
         out = elements.iter().map(|r| BTreeSet::from([*r])).collect();
         out.push(BTreeSet::from([element]));
@@ -140,7 +155,7 @@ impl Rectangle {
         orientations
     }
 
-    /// get dedup key for this rectangle
+    /// get dedup key for this rectangle, ignoring rotation
     pub(crate) fn dedup(&self) -> (RecDimension, RecDimension) {
         let x = match self.height >= 100 {
             true => (self.height / 10) * 10,
@@ -153,6 +168,19 @@ impl Rectangle {
         if x > y {
             return (x, y);
         }
+        (y, x)
+    }
+
+    /// get dedup key for this rectangle
+    pub(crate) fn dedup_permutation(&self) -> (RecDimension, RecDimension) {
+        let x = match self.height >= 100 {
+            true => (self.height / 10) * 10,
+            false => self.height
+        };
+        let y = match self.width >= 100 {
+            true => (self.width / 10) * 10,
+            false => self.width
+        };
         (y, x)
     }
 }

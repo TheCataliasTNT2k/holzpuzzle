@@ -8,8 +8,10 @@ use itertools::Itertools;
 
 use crate::{ProgramStorage, Settings};
 use crate::data_configuration::RectConfiguration;
-use crate::rect::{Combination, combination_from_string, combination_storage_from_file, combination_storage_to_file, combination_to_string, get_unique_combination_key, PlacedRectangle, RecDimension, RecId, Rectangle, RectCombinationStorage, redup_comb_iter};
+
+use crate::rect::{Combination, combination_from_string, combination_storage_from_file, combination_storage_to_file, combination_to_string, duplicate_combination, get_unique_combination_key, get_unique_permutation_key, PlacedRectangle, RecDimension, RecId, Rectangle, RectCombinationStorage};
 use crate::rect_image::draw_image;
+
 
 /// collect all candidates, which may fit inside the big rectangle
 pub(crate) fn step1_generate_candiates(storage: &mut ProgramStorage) {
@@ -27,7 +29,7 @@ pub(crate) fn step1_generate_candiates(storage: &mut ProgramStorage) {
     // for each number of rectangles, collect all combinations
     for s in storage.settings.min_rectangle_amount..=storage.settings.max_rectangle_amount {
         let mut counter2 = 0;
-        for comb in storage.rect_configuration.available_blocks.iter().combinations(s as usize) {
+        for comb in storage.rect_configuration.available_blocks.iter().sorted_by_key(|r| r.id).combinations(s as usize) {
             counter += 1;
             if counter % 1000000 == 0 {
                 println!("{s} {}, {} {}", counter, gathered_combinations.len(), start.elapsed().as_secs());
@@ -64,6 +66,7 @@ pub(crate) fn step2_deduplication(storage: &mut ProgramStorage) {
 
     println!("DEDUPLICATING {} COMBINATIONS...", candidates.len());
     storage.deduplicated_combinations = candidates.into_iter()
+        .sorted_by_key(|c| c.iter().map(|r| r.id as i32).sum::<i32>())
         .unique_by(get_unique_combination_key)
         .collect();
     if let Some(path) = storage.settings.deduplicated_combinations_path {
@@ -150,7 +153,7 @@ pub(crate) fn step3_thread_procedure(number: u8,
         let data = lock.1.remove(0);
         drop(lock);
         if counter % 100 == 0 {
-            println!("Thread {number} working counter {counter} with data {}.", data.iter().map(|r| r.id).join(","));
+            println!("Thread {number} working counter {counter} with data {}. I am alive for {} seconds.", data.iter().map(|r| r.id).join(","), thread_start.elapsed().as_secs());
         }
         // ic combination can be put somehow in the big rect, store it
         if step3_check_candidate(number, counter, storage, &data).is_some() {
@@ -171,11 +174,12 @@ pub(crate) fn step3_check_candidate(number: u8, counter: i32,
     // because the small rectangles can be rotated, we need to check each combination of each rotation for the input
     for product in candidate.iter().map(|r| storage.rect_configuration.rotated_available_block_map.get(&r.id).unwrap()).multi_cartesian_product() {
         // because I have no better idea, just check each permutation of each combination individually
-        for per in product.iter().cloned().permutations(product.len()) {
-            if let Some(sol) = step3_check_permutation(storage, per.clone()) {
+        for per in product.iter().cloned().permutations(product.len()).unique_by(get_unique_permutation_key) {
+            if let Some(sol) = step3_check_permutation(storage, per) {
                 if counter % 100 == 0 && number > 0 {
                     println!("Thread {number} worked {counter} in {} seconds (success)", c_start.elapsed().as_secs());
                 }
+                println!("SOLUTION_DEBUG {}", sol.iter().map(|r| format!("{} {} {} {} {}", r.rect.id, r.rect.height, r.rect.width, r.x, r.y)).join("  "));
                 return Some(sol);
             }
         }
@@ -267,6 +271,7 @@ pub(crate) fn step3_check_permutation(storage: &ProgramStorage, candidate: Vec<&
             if p.compact(&placed_rects) {
                 compacted = true;
                 placed_rects[i] = p;
+                break;
             }
         }
     }
@@ -295,32 +300,59 @@ pub(crate) fn step4_calculate_matches(storage: &mut ProgramStorage) {
         return;
     }
     // sort the candidates by area
-    let candidates = redup_comb_iter(storage.solutions.iter(), storage)
+    let candidates = storage.solutions.iter()
         .sorted_by_key(|c| -(c.iter().map(|r| r.area).sum::<u32>() as i32))
-        .collect::<Vec<BTreeSet<Rectangle>>>();
+        .collect::<Vec<&BTreeSet<Rectangle>>>();
     let start = Instant::now();
 
     println!("CALCULATING COMBINED SOLUTIONS (3 layers) with {} candidates...", candidates.len());
     for i in 0..candidates.len() {
-        if i % 100 == 0 {
-            println!("{} {}", i, storage.combined_solutions.len());
-        }
-        let is = candidates.get(i).unwrap();
+        println!("i {} solutions {}", i, storage.combined_solutions.len());
+        let is = *candidates.get(i).unwrap();
         for j in i + 1..candidates.len() {
-            let js = candidates.get(j).unwrap();
-            let ij = is | js;
-            // two candidates need to be disjunctive, otherwise they can not be a solution
-            if ij.len() == is.len() + js.len() {
-                for k in j + 1..candidates.len() {
-                    let ks = candidates.get(k).unwrap();
-                    // three candidates need to be disjunctive, otherwise they can not be a solution
-                    let amount = (&ij | ks).len();
-                    if amount >= storage.rect_configuration.available_blocks.len() {
-                        let mut solution = BTreeSet::new();
-                        solution.insert(is.to_owned().clone());
-                        solution.insert(js.to_owned().clone());
-                        solution.insert(ks.to_owned().clone());
-                        storage.combined_solutions.insert(solution);
+            let js = *candidates.get(j).unwrap();
+            for k in j + 1..candidates.len() {
+                let ks = *candidates.get(k).unwrap();
+                let amount = is.len() + js.len() + ks.len();
+                if amount >= storage.rect_configuration.available_blocks.len() {
+                    let vec: Vec<&Rectangle> = is.iter()
+                        .map(|r| storage.rect_configuration.duplication_map.get(&r.id).unwrap().first().unwrap())
+                        .chain(
+                            js.iter().map(|r| storage.rect_configuration.duplication_map.get(&r.id).unwrap().first().unwrap())
+                        )
+                        .chain(
+                            ks.iter().map(|r| storage.rect_configuration.duplication_map.get(&r.id).unwrap().first().unwrap())
+                        ).collect();
+                    if storage.rect_configuration.duplication_map.iter().all(
+                        |(id, rects)| vec.iter().filter(|r| &r.id == id).count() <= rects.len()
+                    ) {
+                        println!("{} {} {}", i, j, k);
+                        let mut found = false;
+                        for is2 in duplicate_combination(&mut is.clone(), &storage.rect_configuration.duplication_map, &BTreeSet::new()) {
+                            if found {
+                                break;
+                            }
+                            for js2 in duplicate_combination(&mut js.clone(), &storage.rect_configuration.duplication_map, &is2) {
+                                if found {
+                                    break;
+                                }
+                                let union = &is2 | &js2;
+                                if union.len() >= is2.len() + js2.len() {
+                                    for ks2 in duplicate_combination(&mut ks.clone(), &storage.rect_configuration.duplication_map, &union) {
+                                        if (&union | &ks2).len() >= storage.rect_configuration.available_blocks.len() {
+                                            let mut solution = BTreeSet::new();
+                                            solution.insert(is2.to_owned().clone());
+                                            solution.insert(js2.to_owned().clone());
+                                            solution.insert(ks2.to_owned().clone());
+                                            println!("Found {}", solution.iter().map(combination_to_string).join(" "));
+                                            storage.combined_solutions.insert(solution);
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -437,7 +469,7 @@ fn test_single_combination2() {
             Rectangle::new(21, 2, 7),
             Rectangle::new(22, 2, 5),
             Rectangle::new(23, 3, 4),
-            Rectangle::new(24, 5, 5)
+            Rectangle::new(24, 5, 5),
         ],
     );
 
@@ -466,6 +498,40 @@ fn test_single_combination2() {
         } else {
             println!("Not a solution!");
         }
+    }
+}
+
+#[test]
+fn test_single_combination3() {
+    let rects = crate::data_configuration::mm10_rects_floor();
+
+    let settings = Settings {
+        thread_count: 14,
+        steps: [false, false, false, false],
+        distance_between_rectangles: 10,
+        min_rectangle_amount: 9,
+        max_rectangle_amount: 24,
+        ..Default::default()
+    };
+    let storage = ProgramStorage::new(&rects, settings);
+
+    // check all permutations for solution
+    let s = "4,5,8,9,11,14,15,18".split('\n');
+
+    for s1 in s {
+        let mut c = BTreeSet::new();
+        for id in s1.trim().split(',') {
+            c.insert(*(storage.rect_configuration.available_block_map.get(&id.trim().parse::<RecId>().unwrap()).unwrap()));
+        }
+        let start = Instant::now();
+        for _ in 0..10 {
+            if let Some(data) = step3_check_candidate(100, 0, &storage, &c) {
+                println!("Solution is: {}", data.iter().map(|r| format!("{} {} {}", r.rect.id, r.rect.height, r.rect.width)).join("  "));
+            } else {
+                println!("Not a solution!");
+            }
+        }
+        println!("{:?}", start.elapsed().as_millis());
     }
 }
 
@@ -533,13 +599,13 @@ fn test_multiple_layers() {
             Rectangle::new(17, 2, 2),
             Rectangle::new(18, 1, 2),
             Rectangle::new(19, 1, 2),
-            Rectangle::new(20, 1, 2)
+            Rectangle::new(20, 1, 2),
         ],
     );
 
     let settings = Settings {
         thread_count: 14,
-        steps: [true; 4],
+        steps: [false, false, true, true],
         distance_between_rectangles: 10,
         min_rectangle_amount: 5,
         max_rectangle_amount: 9,
@@ -564,6 +630,67 @@ fn test_multiple_layers() {
 
     println!("The whole run took us {} seconds!", start.elapsed().as_secs());
     println!("{}", storage.solutions.len());
+}
+
+#[test]
+fn test_multiple_layers2() {
+    let start = Instant::now();
+    let rects = RectConfiguration::new(
+        Rectangle::new(-1, 4, 8),
+        vec![
+            Rectangle::new(1, 1, 2),
+            Rectangle::new(2, 1, 2),
+            Rectangle::new(3, 3, 4),
+            Rectangle::new(4, 2, 2),
+            Rectangle::new(5, 2, 3),
+            Rectangle::new(6, 2, 3),
+            Rectangle::new(7, 2, 3),
+            Rectangle::new(8, 2, 3),
+            Rectangle::new(9, 1, 1),
+            Rectangle::new(10, 1, 4),
+            Rectangle::new(11, 1, 4),
+            Rectangle::new(12, 3, 3),
+            Rectangle::new(13, 2, 3),
+            Rectangle::new(14, 2, 2),
+            Rectangle::new(15, 2, 3),
+            Rectangle::new(16, 2, 4),
+            Rectangle::new(17, 2, 2),
+            Rectangle::new(18, 1, 2),
+            Rectangle::new(19, 1, 2),
+            Rectangle::new(20, 1, 2),
+        ],
+    );
+
+    let settings = Settings {
+        thread_count: 14,
+        steps: [false, false, false, false],
+        distance_between_rectangles: 10,
+        min_rectangle_amount: 5,
+        max_rectangle_amount: 9,
+        min_solution_area: 30,
+        ..Default::default()
+    };
+    let mut storage = ProgramStorage::new(&rects, settings);
+
+    // check all permutations for solution
+    let s = "1,2,4,6,7,11,14,18,19
+    3,5,9,10,12
+    8,13,15,16,17,20".split('\n');
+
+    for (i, s1) in s.enumerate() {
+        let mut c = BTreeSet::new();
+        for id in s1.trim().split(',') {
+            c.insert(*(storage.rect_configuration.available_block_map.get(&id.trim().parse::<RecId>().unwrap()).unwrap()));
+        }
+        println!("Testing possible solution: {}", s1.split(',').join(" "));
+        if let Some(data) = step3_check_candidate(100, 0, &storage, &c) {
+            println!("Solution is: {}", data.iter().map(|r| format!("{} {} {}", r.rect.id, r.rect.height, r.rect.width)).join("  "));
+            println!("Area is: {}", data.iter().map(|r| r.rect.area).sum::<u32>());
+            draw_image(&format!("./out{i}.png"), &storage, &data);
+        } else {
+            println!("Not a solution!");
+        }
+    }
 }
 
 /*

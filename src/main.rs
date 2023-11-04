@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use itertools::Itertools;
 
-use crate::data_configuration::{mm100_rects, RectConfiguration};
-use crate::rect::{Combination, RecId, Rectangle, RectCombinationStorage, redup_comb_iter};
+use crate::data_configuration::RectConfiguration;
+use crate::rect::{Combination, RecId, RectCombinationStorage};
 use crate::rect_image::draw_image;
 use crate::steps::{step1_generate_candiates, step2_deduplication, step3_check_candidate, step3_filter_fitting_candidates, step4_calculate_matches, step5_sort_final_combinations};
 
@@ -14,6 +14,7 @@ mod rect;
 mod steps;
 mod rect_image;
 mod data_configuration;
+mod gcd;
 
 pub(crate) struct ProgramStorage<'a> {
     pub rect_configuration: &'a RectConfiguration,
@@ -73,20 +74,20 @@ impl Default for Settings {
 
 fn main() {
     let start = Instant::now();
-    let rects = mm100_rects();
+    let rects = data_configuration::mm10_rects_floor();
 
     let settings = Settings {
         thread_count: 16,
-        min_solution_area: rects.available_blocks.iter().map(|b| b.area).sum::<u32>() - 2 * rects.big_rect.area,
+        min_solution_area: ((rects.available_blocks.iter().map(|b| b.area).sum::<u32>() - 2 * rects.big_rect.area) as f32 * 0.98) as u32,
         min_rectangle_amount: 3,
         max_rectangle_amount: 9,
-        distance_between_rectangles: 100,
-        candidates_path: Some("./candidates.txt"),
-        deduplicated_combinations_path: Some("./deduplicated_candidates.txt"),
-        fitting_candidates_path: Some("./fitting_candidates.txt"),
-        solutions_filepath: Some("./solutions.txt"),
-        final_combinations_path: Some("./final_candidates.txt"),
-        steps: [false, false, false, false],
+        distance_between_rectangles: 50,
+        candidates_path: Some("./step1_candidates.txt"),
+        deduplicated_combinations_path: Some("./step1_deduplicated_candidates.txt"),
+        fitting_candidates_path: Some("./step2_fitting_candidates.txt"),
+        solutions_filepath: Some("./step3_solutions.txt"),
+        final_combinations_path: Some("./step4_final_candidates.txt"),
+        steps: [ true, true, true, false],
     };
     let mut storage = ProgramStorage::new(&rects, settings);
 
@@ -105,20 +106,56 @@ fn main() {
 
 #[test]
 fn test() {
-    let rects = mm100_rects();
+    let rects = data_configuration::mm_rects_floor();
 
     let settings = Settings {
         thread_count: 4,
         steps: [false, false, false, false],
-        distance_between_rectangles: 100,
+        distance_between_rectangles: 10,
         ..Default::default()
     };
-    let storage = ProgramStorage::new(&rects, settings);
+    let mut storage = ProgramStorage::new(&rects, settings);
+
+    /*step1_generate_candiates(&mut storage);
+    step2_deduplication(&mut storage);
+    step3_filter_fitting_candidates(&mut storage);
+    step4_calculate_matches(&mut storage);
+    step5_sort_final_combinations(&mut storage);*/
+
+    /*storage.solutions.iter()
+        .filter(|c| c.iter().map(|r| r.area).sum::<u32>() >= 306291)
+        .sorted_by_key(|c| -(c.iter().map(|r| r.area).sum::<u32>() as i32))
+        .for_each(|c| {
+        println!("{} {}", combination_to_string(c), c.iter().map(|r| r.area).sum::<u32>());
+    });*/
 
     // check all permutations for solution
-    let s = "5,12,13,14,16".split('\n');
+    let s = "3,6,11,13,17,18
+3,6,8,11,13,15,18
+2,3,6,8,13,15
+4,5,7,9,11,14,17
+2,3,6,8,15,17,18
+1,2,4,6,11
+3,4,7,8,9,13,18
+1,2,3,8,11,15,18
+4,5,9,10,11,14,17
+3,4,6,7,9,17
+3,8,9,13,14,15,17
+3,5,7,11,13,17
+5,6,7,9,11,14,17
+2,3,7,8,11,13,18
+3,6,7,8,13,15,18
+3,4,8,9,10,13,18
+4,6,7,10,11,17,18
+1,5,7,10,12,16
+2,9,11,13,14,17,18
+4,7,11,13,14,17
+2,3,6,7,11,17
+5,7,9,10,11,13,16
+3,4,6,9,10,17
+5,8,12,13,15,16,18".split('\n');
 
-    for s1 in s {
+    for (i, s1) in s.enumerate() {
         let mut c = BTreeSet::new();
         for id in s1.trim().split(',') {
             c.insert(*(storage.rect_configuration.available_block_map.get(&id.trim().parse::<RecId>().unwrap()).unwrap()));
@@ -127,13 +164,13 @@ fn test() {
         if let Some(data) = step3_check_candidate(100, 0, &storage, &c) {
             println!("Solution is: {}", data.iter().map(|r| format!("{} {} {}", r.rect.id, r.rect.height, r.rect.width)).join("  "));
             println!("Area is: {}", data.iter().map(|r| r.rect.area).sum::<u32>());
-            draw_image("./out.png", &storage, &data);
+            draw_image(&format!("./out{i}.png"), &storage, &data);
         } else {
             println!("Not a solution!");
         }
     }
 
-    let x: Vec<Combination> = redup_comb_iter(storage.solutions.iter().filter(
+    /*let x: Vec<Combination> = redup_comb_iter(storage.solutions.iter().filter(
         |c| c.iter().map(|r| r.area).sum::<u32>() >= 300000
     )
                                                       .clone(), &storage).collect();
@@ -160,7 +197,7 @@ fn test() {
                 }
             }
         }
-    }
+    }*/
 }
 
 

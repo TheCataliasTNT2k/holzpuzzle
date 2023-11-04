@@ -5,6 +5,7 @@ use imageproc::drawing::{draw_filled_rect_mut, draw_hollow_rect_mut, draw_text_m
 use imageproc::rect::Rect;
 use itertools::Itertools;
 use rusttype::{Font, Scale};
+use crate::gcd::gcd;
 
 use crate::ProgramStorage;
 use crate::rect::{get_smallest_side, PlacedRectangle, RecId};
@@ -19,9 +20,13 @@ pub(crate) fn get_color(id: RecId, len: usize) -> Rgb<u8> {
     ])
 }
 
+#[allow(dead_code)]
 pub(crate) fn draw_image(path: &str, storage: &ProgramStorage, data: &Vec<PlacedRectangle>) {
-    let multiplyer = max(1, 40 / get_smallest_side(data));
-    let font_size = 20 as f32;
+    let font_size = 0_f32;
+    let sides = data.iter().flat_map(|r| [r.rect.height as u64, r.rect.width as u64]).collect_vec();
+    let divisor = sides.iter().fold(*sides.first().unwrap(), |acc, x| gcd(acc, *x)) as u32;
+    let multiplyer = max(1, 80 / (get_smallest_side(data) / divisor));
+    println!("{}", multiplyer);
     let big_rect = storage.rect_configuration.big_rect;
     let width = big_rect.width * multiplyer;
     let height = big_rect.height * multiplyer;
